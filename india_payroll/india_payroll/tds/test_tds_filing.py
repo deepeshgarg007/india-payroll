@@ -12,7 +12,7 @@ from frappe.tests.utils import FrappeTestCase
 from frappe.utils import getdate
 
 from india_payroll.boot import set_bootinfo
-from india_payroll.india_payroll.tds import data_assembly, filing, sheet_json
+from india_payroll.india_payroll.tds import data_assembly, filing, form16, sheet_json
 from india_payroll.india_payroll.tds import settings as tds_settings
 from india_payroll.india_payroll.tds.data_assembly import quarter_range_from_start
 from india_payroll.india_payroll.tds.sandbox_client import (
@@ -1302,3 +1302,77 @@ class TestCredentialResolution(FrappeTestCase):
 		set_bootinfo(bootinfo)
 		self.assertTrue(bootinfo["ip_tds_credentials_from_conf"])
 		self.assertEqual(bootinfo["ip_tds_sandbox_mode_from_conf"], 1)
+
+
+class TestForm16PartA(FrappeTestCase):
+	"""The TRACES security challenge built for the Part A download job."""
+
+	def _row(self, challan, pan, deposited=0.0, deducted=0.0):
+		return frappe._dict(challan=challan, pan=pan, tax_deposited=deposited, tax_deducted=deducted)
+
+	def test_challan_with_most_distinct_pan_amounts_wins(self):
+		name, combos = form16._select_challan_combos(
+			[
+				self._row("CH-1", "AAAPA1234A", 100),
+				self._row("CH-2", "AAAPA1234A", 100),
+				self._row("CH-2", "BBBPB1234B", 200),
+			]
+		)
+		self.assertEqual(name, "CH-2")
+		self.assertEqual(combos, [("AAAPA1234A", 100.0), ("BBBPB1234B", 200.0)])
+
+	def test_amounts_accumulate_per_pan_and_rows_cap_at_three(self):
+		rows = [self._row("CH-1", "AAAPA1234A", 100), self._row("CH-1", "AAAPA1234A", 50)]
+		rows += [self._row("CH-1", f"AAAP{c}1234A", 10) for c in "BCDE"]
+		name, combos = form16._select_challan_combos(rows)
+		self.assertEqual(name, "CH-1")
+		self.assertEqual(len(combos), form16.MAX_PAN_AMOUNT_ROWS)
+		self.assertIn(("AAAPA1234A", 150.0), combos)
+
+	def test_placeholder_pans_and_unmatched_rows_are_skipped(self):
+		name, combos = form16._select_challan_combos(
+			[
+				self._row("CH-1", "PANNOTAVBL", 100),
+				self._row(None, "AAAPA1234A", 100),
+				self._row("CH-1", "AAAPA1234A", 0, deducted=75),
+			]
+		)
+		self.assertEqual(name, "CH-1")
+		self.assertEqual(combos, [("AAAPA1234A", 75.0)], "deposited falls back to deducted")
+
+	def test_no_usable_rows_returns_nothing(self):
+		name, combos = form16._select_challan_combos([self._row("CH-1", "PANNOTAVBL", 100)])
+		self.assertIsNone(name)
+		self.assertEqual(combos, [])
+
+	def test_epoch_ms_is_utc_midnight(self):
+		# Matches Sandbox's documented example: 2024-04-01 -> 1711929600000.
+		self.assertEqual(form16._epoch_ms(getdate("2024-04-01")), 1711929600000)
+		self.assertEqual(form16._epoch_ms("2024-04-01"), 1711929600000)
+
+	def test_pdf_for_pan_picks_the_matching_zip_member(self):
+		import io
+		import zipfile
+
+		buffer = io.BytesIO()
+		with zipfile.ZipFile(buffer, "w") as zf:
+			zf.writestr("FORM16_AAAPA1234A.pdf", "%PDF-A")
+			zf.writestr("FORM16_BBBPB1234B.pdf", "%PDF-B")
+		content = buffer.getvalue()
+
+		self.assertEqual(form16._pdf_for_pan(content, "bbbpb1234b"), b"%PDF-B")
+		self.assertIsNone(form16._pdf_for_pan(content, "CCCPC1234C"))
+		self.assertIsNone(form16._pdf_for_pan(b"not a zip", "AAAPA1234A"))
+
+	def test_traces_username_and_password_must_come_together(self):
+		doc = frappe._dict(traces_username="deductor", traces_password=None)
+		self.assertRaises(frappe.ValidationError, tds_settings.validate_tds_filing_settings, doc)
+
+	def test_missing_traces_credentials_are_refused_when_required(self):
+		settings = frappe._dict(traces_username="deductor")
+		settings.get_password = lambda fieldname, raise_exception=True: None
+		self.assertRaises(frappe.ValidationError, tds_settings.get_traces_credentials, settings)
+
+		credentials = tds_settings.get_traces_credentials(settings, required=False)
+		self.assertEqual(credentials["username"], "deductor")
+		self.assertIsNone(credentials["password"])

@@ -350,6 +350,48 @@ def get_custom_fields():
 				"hidden": 1,
 				"read_only": 1,
 			},
+			{
+				"fieldname": "india_payroll_traces_section",
+				"label": "TRACES (Form 16 Part A)",
+				"fieldtype": "Section Break",
+				"insert_after": "tds_token_expiry",
+				"collapsible": 1,
+				"depends_on": TDS_FILING_ENABLED,
+				"description": (
+					"Deductor account on the TRACES portal (tdscpc.gov.in), used to download "
+					"Form 16 Part A certificates after the Q4 return is filed."
+				),
+			},
+			{
+				"fieldname": "traces_username",
+				"label": "TRACES Username",
+				"fieldtype": "Data",
+				"insert_after": "india_payroll_traces_section",
+				"translatable": 0,
+			},
+			{
+				"fieldname": "traces_password",
+				"label": "TRACES Password",
+				"fieldtype": "Password",
+				"insert_after": "traces_username",
+			},
+			{
+				"fieldname": "india_payroll_traces_cb",
+				"fieldtype": "Column Break",
+				"insert_after": "traces_password",
+			},
+			{
+				"fieldname": "traces_remember_credentials",
+				"label": "Let Sandbox Remember Credentials",
+				"fieldtype": "Check",
+				"default": "1",
+				"insert_after": "india_payroll_traces_cb",
+				"description": (
+					"Sandbox keeps the TRACES credentials for the duration of a Form 16 job, "
+					"so job status can be polled without re-sending them. Unchecking means "
+					"credentials are sent again on every status check."
+				),
+			},
 		],
 		"Company": [
 			{

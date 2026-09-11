@@ -97,6 +97,31 @@ def get_sandbox_credentials(settings=None) -> dict:
 	}
 
 
+def get_traces_credentials(settings=None, required: bool = True) -> dict:
+	"""TRACES portal credentials for Form 16 Part A, from Payroll Settings.
+
+	TRACES accounts belong to the deductor (per TAN), so unlike the Sandbox API
+	pair these are never provisioned through site config.
+	"""
+	if settings is None:
+		settings = frappe.get_cached_doc("Payroll Settings")
+
+	username = (settings.get("traces_username") or "").strip()
+	password = settings.get_password("traces_password", raise_exception=False)
+
+	if required and not (username and password):
+		frappe.throw(
+			_("Set the TRACES Username and Password in Payroll Settings to request Form 16 Part A."),
+			title=_("TRACES Credentials Missing"),
+		)
+
+	return {
+		"username": username,
+		"password": password,
+		"remember_me": cint(settings.get("traces_remember_credentials")),
+	}
+
+
 def conf_sandbox_mode(api_key=None) -> int:
 	"""Which Sandbox environment the cloud-provisioned key belongs to.
 
@@ -116,6 +141,12 @@ def conf_sandbox_mode(api_key=None) -> int:
 
 def validate_tds_filing_settings(doc, method=None):
 	"""Refuse to enable TDS filing without a credential pair to file with."""
+	if bool(doc.get("traces_username")) != bool(doc.get("traces_password")):
+		frappe.throw(
+			_("TRACES Username and Password must be set together."),
+			title=_("Incomplete TRACES Credentials"),
+		)
+
 	if not doc.get("enable_tds_filing") or not doc.has_value_changed("enable_tds_filing"):
 		return
 
