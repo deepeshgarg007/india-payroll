@@ -1364,6 +1364,34 @@ class TestForm16PartA(FrappeTestCase):
 		self.assertIsNone(form16._pdf_for_pan(content, "CCCPC1234C"))
 		self.assertIsNone(form16._pdf_for_pan(b"not a zip", "AAAPA1234A"))
 
+	def test_poll_leaves_part_a_unavailable_when_pan_is_missing_from_archive(self):
+		import io
+		import zipfile
+
+		buffer = io.BytesIO()
+		with zipfile.ZipFile(buffer, "w") as zf:
+			zf.writestr("FORM16_AAAPA1234A.pdf", "%PDF-A")
+		archive = buffer.getvalue()
+
+		doc = frappe._dict(name="F16-X", pan="CCCPC1234C", part_a_job_id="JOB-1", company="Alpha Ltd")
+		doc.get = lambda key, default=None: dict(doc).get(key, default)
+		doc.db_set = lambda *a, **k: doc.setdefault("_db_set", []).append(a or k)
+		doc.add_comment = lambda *a, **k: doc.setdefault("_comments", []).append(a)
+
+		with (
+			patch.object(frappe, "get_doc", return_value=doc),
+			patch.object(form16, "SandboxTDSClient"),
+			patch.object(form16, "_traces_poll_body", return_value={}),
+			patch.object(form16, "_data", return_value={"status": next(iter(form16.SUCCESS_STATUSES))}),
+			patch.object(form16, "_certificate_bytes", return_value=archive),
+			patch.object(form16, "_attach") as attach,
+		):
+			form16._poll_one("F16-X", "a")
+
+		attach.assert_not_called()
+		self.assertIn(("part_a_status", "Failed"), doc["_db_set"])
+		self.assertTrue(doc["_comments"], "the employee is told why Part A is unavailable")
+
 	def test_part_a_submission_is_serialized_per_tan_and_year(self):
 		from contextlib import contextmanager
 
@@ -1405,10 +1433,9 @@ class TestForm16PartA(FrappeTestCase):
 		self.assertEqual(
 			form16._form16_artifact(content, "F16-X", "a", "BBBPB1234B"), ("F16-X-part-A.pdf", b"%PDF-B")
 		)
-		# PAN given but absent from the archive: no silent fallback to someone else's certificate.
-		self.assertEqual(
-			form16._form16_artifact(content, "F16-X", "a", "CCCPC1234C"), ("F16-X-part-A.zip", content)
-		)
+		# PAN given but absent from the archive: neither another employee's PDF nor the
+		# whole multi-employee archive is attached.
+		self.assertIsNone(form16._form16_artifact(content, "F16-X", "a", "CCCPC1234C"))
 		# Without a PAN there is nothing to match on, so the first PDF is still used.
 		self.assertEqual(
 			form16._form16_artifact(content, "F16-X", "b", None), ("F16-X-part-B.pdf", b"%PDF-A")

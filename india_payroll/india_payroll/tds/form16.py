@@ -341,7 +341,19 @@ def _poll_one(docname: str, part: str) -> None:
 	content = _certificate_bytes(client, data, part)
 	if not content:
 		return
-	filename, payload = _form16_artifact(content, doc.name, part, doc.pan)
+	artifact = _form16_artifact(content, doc.name, part, doc.pan)
+	if not artifact:
+		# A multi-employee archive with no certificate for this PAN is never
+		# attached: it would expose every other employee's Part A.
+		doc.db_set(f"part_{part}_status", "Failed")
+		doc.add_comment(
+			"Comment",
+			_("Form 16 Part {0}: the file TRACES returned has no certificate for PAN {1}.").format(
+				part.upper(), doc.pan
+			),
+		)
+		return
+	filename, payload = artifact
 	_attach(doc, f"part_{part}_file", filename, payload)
 	doc.db_set(f"part_{part}_status", "Available")
 
@@ -360,14 +372,17 @@ def _traces_poll_body(doc) -> dict:
 	return body
 
 
-def _form16_artifact(content: bytes, docname: str, part: str, pan: str | None = None) -> tuple[str, bytes]:
+def _form16_artifact(
+	content: bytes, docname: str, part: str, pan: str | None = None
+) -> tuple[str, bytes] | None:
+	"""The single PDF to attach, or None when there is no certificate for this employee."""
 	base = f"{docname}-part-{part.upper()}"
 	pdf = _pdf_for_pan(content, pan) if pan else _extract_from_zip(content, ".pdf")
 	if pdf:
 		return f"{base}.pdf", pdf
 	if content[:5] == b"%PDF-":
 		return f"{base}.pdf", content
-	return f"{base}.zip", content
+	return None
 
 
 def _pdf_for_pan(content: bytes, pan: str | None) -> bytes | None:
