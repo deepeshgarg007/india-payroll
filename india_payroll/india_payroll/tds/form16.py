@@ -375,9 +375,15 @@ def _traces_poll_body(doc) -> dict:
 def _form16_artifact(
 	content: bytes, docname: str, part: str, pan: str | None = None
 ) -> tuple[str, bytes] | None:
-	"""The single PDF to attach, or None when there is no certificate for this employee."""
+	"""The single PDF to attach, or None when there is no certificate for this employee.
+
+	Only Part A archives hold several employees' certificates (one PDF per PAN),
+	so only they are filtered by PAN. A Part B report is requested for one
+	employee and its PDF is taken as is, whatever the file inside is called.
+	"""
 	base = f"{docname}-part-{part.upper()}"
-	pdf = _pdf_for_pan(content, pan) if pan else _extract_from_zip(content, ".pdf")
+	match_pan = part == "a" and pan
+	pdf = _pdf_for_pan(content, pan) if match_pan else _extract_from_zip(content, ".pdf")
 	if pdf:
 		return f"{base}.pdf", pdf
 	if content[:5] == b"%PDF-":

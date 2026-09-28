@@ -1438,7 +1438,15 @@ class TestForm16PartA(FrappeTestCase):
 		self.assertIsNone(form16._form16_artifact(content, "F16-X", "a", "CCCPC1234C"))
 		# Without a PAN there is nothing to match on, so the first PDF is still used.
 		self.assertEqual(
-			form16._form16_artifact(content, "F16-X", "b", None), ("F16-X-part-B.pdf", b"%PDF-A")
+			form16._form16_artifact(content, "F16-X", "a", None), ("F16-X-part-A.pdf", b"%PDF-A")
+		)
+		# Part B is per employee: its PDF is attached even when the filename lacks the PAN.
+		buffer = io.BytesIO()
+		with zipfile.ZipFile(buffer, "w") as zf:
+			zf.writestr("form16_part_b_report.pdf", "%PDF-REPORT")
+		report = buffer.getvalue()
+		self.assertEqual(
+			form16._form16_artifact(report, "F16-X", "b", "CCCPC1234C"), ("F16-X-part-B.pdf", b"%PDF-REPORT")
 		)
 
 	def _with_password(self, **values):
