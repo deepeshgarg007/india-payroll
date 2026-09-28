@@ -13,6 +13,7 @@ from datetime import UTC, datetime, time
 import frappe
 from frappe import _
 from frappe.utils import flt, getdate
+from frappe.utils.synchronization import filelock
 
 from india_payroll.india_payroll.tds.filing import (
 	FAILURE_STATUSES,
@@ -123,6 +124,20 @@ def run_part_b(docname: str) -> None:
 def run_part_a(docname: str) -> None:
 	doc = frappe.get_doc("Form 16", docname)
 
+	# Concurrent jobs for the same TAN/FY would each find no sibling and both
+	# submit; Sandbox rejects the second, leaving that Form 16 with nothing to
+	# poll. Serialize the lookup-and-submit, and commit before releasing so the
+	# next job's lookup sees this one's job id.
+	with filelock(_part_a_lock_name(doc.tan, doc.financial_year), timeout=120):
+		_submit_part_a(doc)
+		frappe.db.commit()  # nosemgrep: the job id must be visible to the next worker's sibling lookup before the lock is released
+
+
+def _part_a_lock_name(tan: str, financial_year: str) -> str:
+	return f"form16-part-a-{tan}-{financial_year}".lower()
+
+
+def _submit_part_a(doc) -> None:
 	# The TRACES job covers the whole TAN/quarter/FY (its zip carries every
 	# employee's certificate) and Sandbox rejects a duplicate submission, so a
 	# sibling Form 16's live job is joined instead of creating another.
@@ -167,7 +182,7 @@ def run_part_a(docname: str) -> None:
 
 
 def _part_a_payload(doc) -> dict:
-	credentials = get_traces_credentials()
+	credentials = get_traces_credentials(doc.company)
 	return {
 		"@entity": TRACES_CREDENTIALS_ENTITY,
 		"username": credentials["username"],
@@ -333,7 +348,7 @@ def _poll_one(docname: str, part: str) -> None:
 
 def _traces_poll_body(doc) -> dict:
 	body = {"@entity": TRACES_CREDENTIALS_ENTITY}
-	credentials = get_traces_credentials(required=False)
+	credentials = get_traces_credentials(doc.company, required=False)
 	if credentials["username"] and credentials["password"]:
 		body.update(
 			{
@@ -347,7 +362,7 @@ def _traces_poll_body(doc) -> dict:
 
 def _form16_artifact(content: bytes, docname: str, part: str, pan: str | None = None) -> tuple[str, bytes]:
 	base = f"{docname}-part-{part.upper()}"
-	pdf = _pdf_for_pan(content, pan) or _extract_from_zip(content, ".pdf")
+	pdf = _pdf_for_pan(content, pan) if pan else _extract_from_zip(content, ".pdf")
 	if pdf:
 		return f"{base}.pdf", pdf
 	if content[:5] == b"%PDF-":

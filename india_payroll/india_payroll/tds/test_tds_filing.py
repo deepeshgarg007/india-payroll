@@ -1364,15 +1364,113 @@ class TestForm16PartA(FrappeTestCase):
 		self.assertIsNone(form16._pdf_for_pan(content, "CCCPC1234C"))
 		self.assertIsNone(form16._pdf_for_pan(b"not a zip", "AAAPA1234A"))
 
+	def test_part_a_submission_is_serialized_per_tan_and_year(self):
+		from contextlib import contextmanager
+
+		doc = frappe._dict(name="F16-X", tan="ABCD12345E", financial_year="2026-2027")
+		held = []
+
+		@contextmanager
+		def fake_lock(name, **kwargs):
+			held.append(name)
+			yield
+			held.append("released")
+
+		def submit(d):
+			# The submission (sibling lookup + POST) must run while the lock is held.
+			self.assertEqual(held, [form16._part_a_lock_name("ABCD12345E", "2026-2027")])
+
+		with (
+			patch.object(form16, "filelock", fake_lock),
+			patch.object(form16, "_submit_part_a", side_effect=submit) as submitted,
+			patch.object(frappe, "get_doc", return_value=doc),
+			patch.object(frappe.db, "commit") as commit,
+		):
+			form16.run_part_a("F16-X")
+
+		submitted.assert_called_once_with(doc)
+		commit.assert_called_once()
+		self.assertEqual(held, ["form16-part-a-abcd12345e-2026-2027", "released"])
+
+	def test_form16_artifact_never_attaches_another_employees_pdf(self):
+		import io
+		import zipfile
+
+		buffer = io.BytesIO()
+		with zipfile.ZipFile(buffer, "w") as zf:
+			zf.writestr("FORM16_AAAPA1234A.pdf", "%PDF-A")
+			zf.writestr("FORM16_BBBPB1234B.pdf", "%PDF-B")
+		content = buffer.getvalue()
+
+		self.assertEqual(
+			form16._form16_artifact(content, "F16-X", "a", "BBBPB1234B"), ("F16-X-part-A.pdf", b"%PDF-B")
+		)
+		# PAN given but absent from the archive: no silent fallback to someone else's certificate.
+		self.assertEqual(
+			form16._form16_artifact(content, "F16-X", "a", "CCCPC1234C"), ("F16-X-part-A.zip", content)
+		)
+		# Without a PAN there is nothing to match on, so the first PDF is still used.
+		self.assertEqual(
+			form16._form16_artifact(content, "F16-X", "b", None), ("F16-X-part-B.pdf", b"%PDF-A")
+		)
+
+	def _with_password(self, **values):
+		"""A stand-in for Payroll Settings or one of its company rows."""
+		doc = frappe._dict(values)
+		doc.get_password = lambda fieldname, raise_exception=True: values.get(fieldname)
+		return doc
+
 	def test_traces_username_and_password_must_come_together(self):
-		doc = frappe._dict(traces_username="deductor", traces_password=None)
-		self.assertRaises(frappe.ValidationError, tds_settings.validate_tds_filing_settings, doc)
+		settings = frappe._dict(traces_username="deductor", traces_password=None)
+		self.assertRaises(frappe.ValidationError, tds_settings.validate_traces_pairs, settings)
+
+		row = frappe._dict(idx=1, company="Alpha Ltd", traces_username="alpha", traces_password=None)
+		settings = frappe._dict(enable_multi_company_payroll=1, company_payroll_settings=[row])
+		self.assertRaises(frappe.ValidationError, tds_settings.validate_traces_pairs, settings)
 
 	def test_missing_traces_credentials_are_refused_when_required(self):
-		settings = frappe._dict(traces_username="deductor")
-		settings.get_password = lambda fieldname, raise_exception=True: None
-		self.assertRaises(frappe.ValidationError, tds_settings.get_traces_credentials, settings)
+		settings = self._with_password(traces_username="deductor")
+		with patch.object(frappe, "get_cached_doc", return_value=settings):
+			self.assertRaises(frappe.ValidationError, tds_settings.get_traces_credentials, "Alpha Ltd")
 
-		credentials = tds_settings.get_traces_credentials(settings, required=False)
+			credentials = tds_settings.get_traces_credentials("Alpha Ltd", required=False)
 		self.assertEqual(credentials["username"], "deductor")
 		self.assertIsNone(credentials["password"])
+
+	def test_single_company_site_uses_the_payroll_settings_login_for_any_company(self):
+		settings = self._with_password(
+			traces_username="deductor", traces_password="secret", traces_remember_credentials=1
+		)
+		with patch.object(frappe, "get_cached_doc", return_value=settings):
+			credentials = tds_settings.get_traces_credentials("Alpha Ltd")
+		self.assertEqual(credentials, {"username": "deductor", "password": "secret", "remember_me": 1})
+
+	def test_multi_company_site_uses_each_companys_own_login(self):
+		settings = self._with_password(
+			enable_multi_company_payroll=1,
+			traces_username="stale-global",
+			traces_password="stale-global",
+			company_payroll_settings=[
+				self._with_password(company="Alpha Ltd", traces_username="alpha", traces_password="a-secret"),
+				self._with_password(
+					company="Beta Ltd",
+					traces_username="beta",
+					traces_password="b-secret",
+					traces_remember_credentials=1,
+				),
+			],
+		)
+		with patch.object(frappe, "get_cached_doc", return_value=settings):
+			alpha = form16._traces_poll_body(frappe._dict(company="Alpha Ltd", tan="ALPA12345A"))
+			beta = form16._traces_poll_body(frappe._dict(company="Beta Ltd", tan="BETA12345B"))
+			# A company without a row must not fall back to the global login.
+			self.assertRaises(frappe.ValidationError, tds_settings.get_traces_credentials, "Gamma Ltd")
+			gamma = tds_settings.get_traces_credentials("Gamma Ltd", required=False)
+
+		self.assertEqual(
+			(alpha["username"], alpha["password"], alpha["tan"]), ("alpha", "a-secret", "ALPA12345A")
+		)
+		self.assertEqual(
+			(beta["username"], beta["password"], beta["tan"]), ("beta", "b-secret", "BETA12345B")
+		)
+		self.assertEqual(gamma, {"username": "", "password": None, "remember_me": 0})
