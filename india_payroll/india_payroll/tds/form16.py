@@ -13,7 +13,6 @@ from datetime import UTC, datetime, time
 import frappe
 from frappe import _
 from frappe.utils import flt, getdate
-from frappe.utils.synchronization import filelock
 
 from india_payroll.india_payroll.tds.filing import (
 	FAILURE_STATUSES,
@@ -123,36 +122,14 @@ def run_part_b(docname: str) -> None:
 
 def run_part_a(docname: str) -> None:
 	doc = frappe.get_doc("Form 16", docname)
-
-	# Concurrent jobs for the same TAN/FY would each find no sibling and both
-	# submit; Sandbox rejects the second, leaving that Form 16 with nothing to
-	# poll. Serialize the lookup-and-submit, and commit before releasing so the
-	# next job's lookup sees this one's job id.
-	with filelock(_part_a_lock_name(doc.tan, doc.financial_year), timeout=120):
-		_submit_part_a(doc)
-		frappe.db.commit()  # nosemgrep: the job id must be visible to the next worker's sibling lookup before the lock is released
-
-
-def _part_a_lock_name(tan: str, financial_year: str) -> str:
-	return f"form16-part-a-{tan}-{financial_year}".lower()
+	_submit_part_a(doc)
 
 
 def _submit_part_a(doc) -> None:
 	# The TRACES job covers the whole TAN/quarter/FY (its zip carries every
 	# employee's certificate) and Sandbox rejects a duplicate submission, so a
 	# sibling Form 16's live job is joined instead of creating another.
-	sibling = frappe.db.get_value(
-		"Form 16",
-		{
-			"name": ["!=", doc.name],
-			"tan": doc.tan,
-			"financial_year": doc.financial_year,
-			"part_a_status": ["in", ("Requested", "Available")],
-			"part_a_job_id": ["is", "set"],
-		},
-		["part_a_job_id", "traces_request_id"],
-		as_dict=True,
-	)
+	sibling = _lock_and_find_sibling(doc)
 	if sibling:
 		doc.db_set(
 			{
@@ -178,6 +155,32 @@ def _submit_part_a(doc) -> None:
 			"traces_request_id": data.get("request_id") or data.get("traces_request_id"),
 			"part_a_status": "Requested",
 		}
+	)
+
+
+def _lock_and_find_sibling(doc) -> "frappe._dict | None":
+	"""Row-lock every Form 16 of this TAN and year, then return a sibling with a live job.
+
+	Concurrent jobs for the same TAN/FY would otherwise each find no sibling and
+	both submit; Sandbox rejects the second, leaving that Form 16 with nothing
+	to poll. The FOR UPDATE locks are held until this job's transaction commits
+	when it finishes, so a concurrent job blocks on the same select and then
+	reads the job id this one stored. No early commit is needed.
+	"""
+	rows = frappe.db.get_values(
+		"Form 16",
+		{"tan": doc.tan, "financial_year": doc.financial_year},
+		["name", "part_a_job_id", "traces_request_id", "part_a_status"],
+		as_dict=True,
+		for_update=True,
+	)
+	return next(
+		(
+			row
+			for row in rows or []
+			if row.name != doc.name and row.part_a_job_id and row.part_a_status in ("Requested", "Available")
+		),
+		None,
 	)
 
 

@@ -1392,33 +1392,35 @@ class TestForm16PartA(FrappeTestCase):
 		self.assertIn(("part_a_status", "Failed"), doc["_db_set"])
 		self.assertTrue(doc["_comments"], "the employee is told why Part A is unavailable")
 
-	def test_part_a_submission_is_serialized_per_tan_and_year(self):
-		from contextlib import contextmanager
+	def test_part_a_sibling_lookup_row_locks_the_tan_and_year(self):
+		doc = frappe._dict(name="F16-SELF", tan="ABCD12345E", financial_year="2026-2027")
+		rows = [
+			frappe._dict(name="F16-SELF", part_a_job_id="JOB-SELF", part_a_status="Requested"),
+			frappe._dict(name="F16-FAILED", part_a_job_id="JOB-OLD", part_a_status="Failed"),
+			frappe._dict(name="F16-PENDING", part_a_job_id=None, part_a_status="Pending"),
+			frappe._dict(
+				name="F16-LIVE", part_a_job_id="JOB-1", traces_request_id="REQ-1", part_a_status="Requested"
+			),
+		]
+		with patch.object(frappe.db, "get_values", return_value=rows) as get_values:
+			sibling = form16._lock_and_find_sibling(doc)
 
+		self.assertEqual(sibling.name, "F16-LIVE")
+		_, kwargs = get_values.call_args
+		self.assertTrue(kwargs["for_update"], "concurrent jobs must block on the same rows")
+		self.assertEqual(get_values.call_args[0][1], {"tan": "ABCD12345E", "financial_year": "2026-2027"})
+
+	def test_part_a_job_does_not_commit_midway(self):
 		doc = frappe._dict(name="F16-X", tan="ABCD12345E", financial_year="2026-2027")
-		held = []
-
-		@contextmanager
-		def fake_lock(name, **kwargs):
-			held.append(name)
-			yield
-			held.append("released")
-
-		def submit(d):
-			# The submission (sibling lookup + POST) must run while the lock is held.
-			self.assertEqual(held, [form16._part_a_lock_name("ABCD12345E", "2026-2027")])
-
 		with (
-			patch.object(form16, "filelock", fake_lock),
-			patch.object(form16, "_submit_part_a", side_effect=submit) as submitted,
+			patch.object(form16, "_submit_part_a") as submitted,
 			patch.object(frappe, "get_doc", return_value=doc),
 			patch.object(frappe.db, "commit") as commit,
 		):
 			form16.run_part_a("F16-X")
 
 		submitted.assert_called_once_with(doc)
-		commit.assert_called_once()
-		self.assertEqual(held, ["form16-part-a-abcd12345e-2026-2027", "released"])
+		commit.assert_not_called()
 
 	def test_form16_artifact_never_attaches_another_employees_pdf(self):
 		import io
